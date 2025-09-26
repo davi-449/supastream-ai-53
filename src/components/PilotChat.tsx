@@ -102,7 +102,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
             .select('*')
             .eq('project_id', projectId)
             .eq('user_id', user.id)
-            .single();
+            .maybeSingle();
 
           if (existingChat) {
             currentChatId = existingChat.id;
@@ -112,8 +112,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
               .from('chats')
               .insert({ 
                 project_id: projectId,
-                user_id: user.id,
-                title: `${projectName} Chat`
+                user_id: user.id
               })
               .select()
               .single();
@@ -127,7 +126,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
             .select('*')
             .eq('project_id', projectId)
             .eq('session_id', sessionId)
-            .single();
+            .maybeSingle();
 
           if (existingChat) {
             currentChatId = existingChat.id;
@@ -138,8 +137,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
               .insert({ 
                 project_id: projectId,
                 session_id: sessionId,
-                user_id: null,
-                title: `${projectName} Chat (Anônimo)`
+                user_id: null
               })
               .select()
               .single();
