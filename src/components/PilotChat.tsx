@@ -12,6 +12,7 @@ import SafeMarkdown from "@/lib/SafeMarkdown";
 import { useFeatureFlags } from "@/hooks/use-feature-flags";
 import { knowledge, KnowledgeFile } from "@/lib/knowledge";
 import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface Attachment { id: string; name: string; type: string; url: string; }
 
@@ -51,7 +52,9 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
   const { gemini } = useFeatureFlags();
   const geminiAtivo = !!gemini;
   const [isLoading, setIsLoading] = useState(false);
+  const [chatLoading, setChatLoading] = useState(true);
   const { toast } = useToast();
+  const { user, loading: authLoading } = useAuth();
   const isProcessingRef = useRef(false);
 
   // Gemini availability: feature flag + backend health
@@ -70,16 +73,111 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
 
   const accessibleFiles = useMemo(() => knowledge.queryAccessible(projectId).files, [projectId, messages.length, hasDocuments]);
 
+  // Helper function to get or generate session ID for anonymous users
+  const getSessionId = () => {
+    try {
+      const stored = localStorage.getItem('pilot_session_id');
+      if (stored) return stored;
+      const newSessionId = genId('session');
+      localStorage.setItem('pilot_session_id', newSessionId);
+      return newSessionId;
+    } catch {
+      return genId('session');
+    }
+  };
+
   useEffect(() => {
+    // Don't initialize chat until auth loading is complete
+    if (authLoading) return;
+
     const initializeChat = async () => {
+      setChatLoading(true);
       try {
-        // Get current user
-        const { data: { user } } = await supabase.auth.getUser();
-        if (!user) {
-          console.log('No authenticated user found');
+        let currentChatId;
+
+        if (user) {
+          // Authenticated user: get or create chat by user_id
+          let { data: existingChat } = await (supabase as any)
+            .from('chats')
+            .select('*')
+            .eq('project_id', projectId)
+            .eq('user_id', user.id)
+            .single();
+
+          if (existingChat) {
+            currentChatId = existingChat.id;
+          } else {
+            // Create new chat for authenticated user
+            const { data: newChat } = await (supabase as any)
+              .from('chats')
+              .insert({ 
+                project_id: projectId,
+                user_id: user.id,
+                title: `${projectName} Chat`
+              })
+              .select()
+              .single();
+            currentChatId = newChat?.id;
+          }
+        } else {
+          // Anonymous user: get or create chat by session_id
+          const sessionId = getSessionId();
+          const { data: existingChat } = await (supabase as any)
+            .from('chats')
+            .select('*')
+            .eq('project_id', projectId)
+            .eq('session_id', sessionId)
+            .single();
+
+          if (existingChat) {
+            currentChatId = existingChat.id;
+          } else {
+            // Create new anonymous chat
+            const { data: newChat } = await (supabase as any)
+              .from('chats')
+              .insert({ 
+                project_id: projectId,
+                session_id: sessionId,
+                user_id: null,
+                title: `${projectName} Chat (Anônimo)`
+              })
+              .select()
+              .single();
+            currentChatId = newChat?.id;
+          }
+        }
+
+        if (!currentChatId) {
+          throw new Error('Falha ao criar ou recuperar chat');
+        }
+
+        setChatId(currentChatId);
+
+        // Load existing messages
+        const { data: existingMessages } = await (supabase as any)
+          .from('messages')
+          .select('*')
+          .eq('chat_id', currentChatId)
+          .order('created_at', { ascending: true });
+
+        if (existingMessages && existingMessages.length > 0) {
+          const formattedMessages: Message[] = existingMessages.map(msg => ({
+            id: msg.id,
+            content: msg.content,
+            sender: (msg.sender === 'user' ? 'user' : 'pilot') as 'user' | 'pilot',
+            timestamp: msg.created_at || new Date().toISOString(),
+            status: 'sent' as const
+          }));
+          setMessages(formattedMessages);
+        } else {
+          // Add initial greeting message
+          const greeting = user 
+            ? `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Como posso ajudá-lo hoje?`
+            : `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Faça login para salvar o histórico do chat permanentemente.`;
+          
           const hello: Message = {
             id: "hello",
-            content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Faça login para salvar o histórico do chat.`,
+            content: greeting,
             sender: "pilot",
             timestamp: new Date().toISOString(),
             status: "sent",
@@ -87,105 +185,52 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
             checklist: buildChecklist(projectId),
           };
           setMessages([hello]);
-          return;
         }
 
-        // Create or get existing chat for this project and user
-        let { data: existingChat } = await supabase
-          .from('chats')
-          .select('*')
-          .eq('project_id', projectId)
-          .eq('user_id', user.id)
-          .single();
+        // Setup real-time subscription for new messages
+        const channel = supabase
+          .channel('chat-messages')
+          .on(
+            'postgres_changes',
+            {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'messages',
+              filter: `chat_id=eq.${currentChatId}`
+            },
+            (payload) => {
+              const newMessage: Message = {
+                id: payload.new.id,
+                sender: payload.new.sender === 'user' ? 'user' : 'pilot',
+                content: payload.new.content,
+                timestamp: payload.new.created_at,
+                status: 'sent'
+              };
+              
+              setMessages(prev => {
+                // Avoid duplicates by checking if message already exists
+                if (prev.some(msg => msg.id === newMessage.id)) {
+                  return prev;
+                }
+                return [...prev, newMessage];
+              });
+            }
+          )
+          .subscribe();
 
-        let currentChatId;
-        if (existingChat) {
-          currentChatId = existingChat.id;
-        } else {
-          // Create new chat
-          const { data: newChat } = await supabase
-            .from('chats')
-            .insert({ 
-              project_id: projectId,
-              user_id: user.id,
-              title: `${projectName} Chat`
-            })
-            .select()
-            .single();
-          currentChatId = newChat?.id;
-        }
+        // Cleanup subscription on unmount
+        return () => {
+          supabase.removeChannel(channel);
+        };
 
-        setChatId(currentChatId);
-
-        if (currentChatId) {
-          // Load existing messages
-          const { data: existingMessages } = await supabase
-            .from('messages')
-            .select('*')
-            .eq('chat_id', currentChatId)
-            .order('created_at', { ascending: true });
-
-          if (existingMessages && existingMessages.length > 0) {
-            const formattedMessages: Message[] = existingMessages.map(msg => ({
-              id: msg.id,
-              content: msg.content,
-              sender: (msg.sender === 'user' ? 'user' : 'pilot') as 'user' | 'pilot', // Map assistant -> pilot
-              timestamp: msg.created_at || new Date().toISOString(),
-              status: 'sent' as const
-            }));
-            setMessages(formattedMessages);
-          } else {
-            // Add initial greeting message
-            const hello: Message = {
-              id: "hello",
-              content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Como posso ajudá-lo hoje?`,
-              sender: "pilot",
-              timestamp: new Date().toISOString(),
-              status: "sent",
-              sources: accessibleFiles,
-              checklist: buildChecklist(projectId),
-            };
-            setMessages([hello]);
-          }
-
-          // Setup real-time subscription for new messages
-          const channel = supabase
-            .channel('chat-messages')
-            .on(
-              'postgres_changes',
-              {
-                event: 'INSERT',
-                schema: 'public',
-                table: 'messages',
-                filter: `chat_id=eq.${currentChatId}`
-              },
-              (payload) => {
-                const newMessage: Message = {
-                  id: payload.new.id,
-                  sender: payload.new.sender === 'user' ? 'user' : 'pilot',
-                  content: payload.new.content,
-                  timestamp: payload.new.created_at,
-                  status: 'sent'
-                };
-                
-                setMessages(prev => {
-                  // Avoid duplicates by checking if message already exists
-                  if (prev.some(msg => msg.id === newMessage.id)) {
-                    return prev;
-                  }
-                  return [...prev, newMessage];
-                });
-              }
-            )
-            .subscribe();
-
-          // Cleanup subscription on unmount
-          return () => {
-            supabase.removeChannel(channel);
-          };
-        }
       } catch (error) {
         console.error('Error initializing chat:', error);
+        toast({
+          title: 'Erro ao inicializar chat',
+          description: 'Não foi possível conectar ao chat. Tentando novamente...',
+          variant: 'destructive'
+        });
+        
         // Fallback to initial message
         const hello: Message = {
           id: "hello",
@@ -197,12 +242,14 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
           checklist: buildChecklist(projectId),
         };
         setMessages([hello]);
+      } finally {
+        setChatLoading(false);
       }
     };
 
     initializeChat();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+  }, [user, authLoading, projectId]);
 
   useEffect(() => {
     // Local persistence disabled. All chat history should be stored in Supabase only.
@@ -288,7 +335,15 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
   const handleSendMessage = async () => {
     // Proteção dupla contra múltiplas submissões
     if (!geminiAtivo) { addSystemMessage('Atenção: Gemini/IA desativado no momento. Ative para enviar mensagens.'); return; }
-    if (!inputValue.trim() || isLoading || isProcessingRef.current) return;
+    if (!inputValue.trim() || isLoading || isProcessingRef.current || chatLoading) return;
+    if (!chatId) {
+      toast({
+        title: 'Chat não inicializado',
+        description: 'Aguarde a inicialização do chat antes de enviar mensagens.',
+        variant: 'destructive'
+      });
+      return;
+    }
     
     // Bloquear imediatamente para evitar race conditions
     isProcessingRef.current = true;
@@ -674,7 +729,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
             e.preventDefault();
             // Apenas prevenir default, usar onKeyDown para enviar
           }}>
-            <label htmlFor="file-input" className={`inline-flex items-center justify-center w-9 h-9 rounded-md border hover:bg-muted cursor-pointer ${!geminiAtivo || isLoading || isProcessingRef.current ? 'opacity-50 pointer-events-none' : ''}`} title="Enviar arquivo" aria-label="Enviar arquivo">
+            <label htmlFor="file-input" className={`inline-flex items-center justify-center w-9 h-9 rounded-md border hover:bg-muted cursor-pointer ${chatLoading || !geminiAtivo || isLoading || isProcessingRef.current ? 'opacity-50 pointer-events-none' : ''}`} title="Enviar arquivo" aria-label="Enviar arquivo">
               <Paperclip className="h-4 w-4" />
             </label>
             <input 
@@ -685,22 +740,22 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
               onChange={handleFilePick} 
               multiple 
               aria-hidden 
-              disabled={isLoading || isProcessingRef.current || !geminiAtivo}
+              disabled={chatLoading || isLoading || isProcessingRef.current || !geminiAtivo}
             />
             <Input
               id="pilot-input"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Digite sua mensagem para o Pilot"
+              placeholder={chatLoading ? "Inicializando chat..." : "Digite sua mensagem para o Pilot"}
               className="flex-1"
-              disabled={isLoading || !geminiAtivo || isProcessingRef.current}
+              disabled={chatLoading || isLoading || !geminiAtivo || isProcessingRef.current}
               aria-label="Mensagem para o Pilot"
             />
             <Button 
               type="button" 
               onClick={handleSendMessage}
-              disabled={!inputValue.trim() || isLoading || !geminiAtivo || isProcessingRef.current} 
+              disabled={chatLoading || !inputValue.trim() || isLoading || !geminiAtivo || isProcessingRef.current} 
               aria-label="Enviar mensagem"
             >
               <Send className="h-4 w-4" />
