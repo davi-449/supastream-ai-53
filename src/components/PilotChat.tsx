@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { supabase } from '@/integrations/supabase/client';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -63,36 +64,38 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
-  // Supabase client is kept only in memory (ref) and never persisted to localStorage or UI
+  // Supabase client ref for commands
   const supabaseRef = useRef<SupabaseClient | null>(null);
-  const [supabaseStatus, setSupabaseStatus] = useState<'disconnected'|'connecting'|'connected'|'error'>('disconnected');
+  const [supabaseStatus, setSupabaseStatus] = useState<'disconnected'|'connecting'|'connected'|'error'>('connected');
 
   const accessibleFiles = useMemo(() => knowledge.queryAccessible(projectId).files, [projectId, messages.length, hasDocuments]);
 
   useEffect(() => {
     const initializeChat = async () => {
-      const client = supabaseRef.current;
-      if (!client) {
-        // Initialize with greeting message if no Supabase connection
-        const hello: Message = {
-          id: "hello",
-          content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Conecte o Supabase para carregar dados reais.`,
-          sender: "pilot",
-          timestamp: new Date().toISOString(),
-          status: "sent",
-          sources: accessibleFiles,
-          checklist: buildChecklist(projectId),
-        };
-        setMessages([hello]);
-        return;
-      }
-
       try {
-        // Create or get existing chat for this project
-        const { data: existingChat } = await client
+        // Get current user
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          console.log('No authenticated user found');
+          const hello: Message = {
+            id: "hello",
+            content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Faça login para salvar o histórico do chat.`,
+            sender: "pilot",
+            timestamp: new Date().toISOString(),
+            status: "sent",
+            sources: accessibleFiles,
+            checklist: buildChecklist(projectId),
+          };
+          setMessages([hello]);
+          return;
+        }
+
+        // Create or get existing chat for this project and user
+        let { data: existingChat } = await supabase
           .from('chats')
           .select('*')
           .eq('project_id', projectId)
+          .eq('user_id', user.id)
           .single();
 
         let currentChatId;
@@ -100,9 +103,13 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
           currentChatId = existingChat.id;
         } else {
           // Create new chat
-          const { data: newChat } = await client
+          const { data: newChat } = await supabase
             .from('chats')
-            .insert({ project_id: projectId })
+            .insert({ 
+              project_id: projectId,
+              user_id: user.id,
+              title: `${projectName} Chat`
+            })
             .select()
             .single();
           currentChatId = newChat?.id;
@@ -112,17 +119,17 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
 
         if (currentChatId) {
           // Load existing messages
-          const { data: existingMessages } = await client
+          const { data: existingMessages } = await supabase
             .from('messages')
             .select('*')
             .eq('chat_id', currentChatId)
             .order('created_at', { ascending: true });
 
           if (existingMessages && existingMessages.length > 0) {
-            const formattedMessages = existingMessages.map(msg => ({
+            const formattedMessages: Message[] = existingMessages.map(msg => ({
               id: msg.id,
               content: msg.content,
-              sender: msg.sender as 'user' | 'pilot',
+              sender: (msg.sender === 'user' ? 'user' : 'pilot') as 'user' | 'pilot', // Map assistant -> pilot
               timestamp: msg.created_at || new Date().toISOString(),
               status: 'sent' as const
             }));
@@ -140,13 +147,49 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
             };
             setMessages([hello]);
           }
+
+          // Setup real-time subscription for new messages
+          const channel = supabase
+            .channel('chat-messages')
+            .on(
+              'postgres_changes',
+              {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'messages',
+                filter: `chat_id=eq.${currentChatId}`
+              },
+              (payload) => {
+                const newMessage: Message = {
+                  id: payload.new.id,
+                  sender: payload.new.sender === 'user' ? 'user' : 'pilot',
+                  content: payload.new.content,
+                  timestamp: payload.new.created_at,
+                  status: 'sent'
+                };
+                
+                setMessages(prev => {
+                  // Avoid duplicates by checking if message already exists
+                  if (prev.some(msg => msg.id === newMessage.id)) {
+                    return prev;
+                  }
+                  return [...prev, newMessage];
+                });
+              }
+            )
+            .subscribe();
+
+          // Cleanup subscription on unmount
+          return () => {
+            supabase.removeChannel(channel);
+          };
         }
       } catch (error) {
         console.error('Error initializing chat:', error);
         // Fallback to initial message
         const hello: Message = {
           id: "hello",
-          content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Conecte o Supabase para carregar dados reais.`,
+          content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Erro ao conectar com o banco de dados.`,
           sender: "pilot",
           timestamp: new Date().toISOString(),
           status: "sent",
@@ -159,7 +202,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
 
     initializeChat();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, supabaseRef.current]);
+  }, [projectId]);
 
   useEffect(() => {
     // Local persistence disabled. All chat history should be stored in Supabase only.
@@ -286,7 +329,6 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
       return;
     }
 
-    const now = new Date().toISOString();
     const content = inputValue;
     if (isDuplicateUserMessage(content, replyTo?.id, pendingFiles)) {
       addSystemMessage('Mensagem duplicada impedida.');
@@ -295,102 +337,72 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
       return;
     }
 
-    const userMessage: Message = {
-      id: genId('u'),
-      content: content,
-      sender: "user",
-      timestamp: now,
-      status: "sending",
-      replyToId: replyTo?.id,
-      attachments: pendingFiles,
-    };
-    setMessages((prev) => [...prev, userMessage]);
+    const messageId = genId('u');
     setInputValue("");
     setReplyTo(null);
     setPendingFiles([]);
     setIsLoading(true);
 
-    // If Gemini is enabled (feature flag + backend health), call backend proxy
-    if (geminiEnabled) {
-      try {
-        if (!chatId) {
-          throw new Error('Chat not initialized');
-        }
+    try {
+      if (!chatId) {
+        throw new Error('Chat not initialized');
+      }
 
+      // Insert user message into database first
+      await supabase.from('messages').insert({
+        id: messageId,
+        chat_id: chatId,
+        content: content,
+        sender: 'user'
+      });
+
+      // If Gemini is enabled (feature flag + backend health), call backend proxy
+      if (geminiEnabled) {
         const resp = await fetch('https://emfddmyurnlsvpvlplzj.supabase.co/functions/v1/gemini', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVtZmRkbXl1cm5sc3ZwdmxwbHpqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1ODcyMDIxNiwiZXhwIjoyMDc0Mjk2MjE2fQ._b-t-Kvxq5o_FYuinbMLG4FqT4dfQ6HDeKamIJ9QBTo',
+          },
           body: JSON.stringify({ prompt: content, chatId })
         });
-        const out = await resp.json();
+        
         if (!resp.ok) {
+          const out = await resp.json();
           const message = out?.error || `Gemini proxy error (${resp.status})`;
           toast({ title: 'Erro Gemini', description: message, variant: 'destructive' });
-          addSystemMessage('Erro Gemini: ' + (out?.error || 'Resposta inválida'));
-          setIsLoading(false);
-          return;
+          throw new Error(message);
         }
-        const text = out?.text || out?.raw?.candidates?.[0]?.content?.parts?.[0]?.text || out?.raw?.output?.[0]?.content?.[0]?.text || JSON.stringify(out?.raw || out).slice(0, 2000);
-        const reply: Message = {
-          id: genId('p'),
-          sender: 'pilot',
-          timestamp: new Date().toISOString(),
-          status: 'sent',
-          sources: knowledge.queryAccessible(projectId).files.slice(0, 5),
-          checklist: buildChecklist(projectId),
-          content: text || 'Sem resposta do Gemini.'
-        };
-        setMessages((prev) => [...prev, reply]);
-        // Marcar mensagem do usuário como enviada com sucesso
-        setMessages(prev => prev.map(m => 
-          m.id === userMessage.id ? { ...m, status: 'sent' } : m
-        ));
-      } catch (err: any) {
-        toast({ title: 'Erro Gemini', description: err?.message || 'Falha ao contactar Gemini', variant: 'destructive' });
-        addSystemMessage('Erro Gemini: ' + (err?.message || String(err)));
-        // Marcar mensagem do usuário como erro
-        setMessages(prev => prev.map(m => 
-          m.id === userMessage.id ? { ...m, status: 'error' } : m
-        ));
-      } finally {
-        setIsLoading(false);
-        isProcessingRef.current = false;
-      }
-    } else {
-      // Fallback local reply (existing behavior) when Gemini is not enabled
-      const files = knowledge.queryAccessible(projectId).files;
-      const sources = files.slice(0, Math.min(5, files.length));
-      const attachmentsNote = userMessage.attachments?.length ? `\n\n### 📎 Anexos\n${userMessage.attachments.map((a, i) => `${i + 1}. ${a.name}`).join("\n")}` : "";
-      const replyContent = [
-        `## Análise`,
-        `Com base no contexto do projeto **${projectName}** e no acervo acessível, seguem sugestões:`,
-        `### ✅ Checklist de Ações`,
-        `- [ ] Revisar documentação relevante`,
-        `- [ ] Implementar a próxima tarefa`,
-        `- [ ] Testar integração e fluxos`,
-        `- [ ] Validar com stakeholders`,
-        `### ℹ️ Fontes`,
-        sources.length > 0 ? sources.map((s, i) => `${i + 1}. ${s.filename}`).join("\n") : `Nenhum PDF cadastrado ainda`,
-        attachmentsNote,
-      ].join("\n\n");
-      // Avoid adding duplicate pilot reply
-      setMessages((prev) => {
-        if (prev.some(m => m.sender === 'pilot' && m.content === replyContent)) return prev;
-        const reply: Message = {
-          id: genId('p'),
-          sender: "pilot",
-          timestamp: new Date().toISOString(),
-          status: "sent",
-          sources,
-          checklist: buildChecklist(projectId),
+        
+        // Assistant response will be inserted by Edge function and displayed via real-time subscription
+      } else {
+        // Fallback response - insert directly into database
+        const files = knowledge.queryAccessible(projectId).files;
+        const sources = files.slice(0, Math.min(5, files.length));
+        const replyContent = [
+          `## Análise`,
+          `Com base no contexto do projeto **${projectName}** e no acervo acessível, seguem sugestões:`,
+          `### ✅ Checklist de Ações`,
+          `- [ ] Revisar documentação relevante`,
+          `- [ ] Implementar a próxima tarefa`,
+          `- [ ] Testar integração e fluxos`,
+          `- [ ] Validar com stakeholders`,
+          `### ℹ️ Fontes`,
+          sources.length > 0 ? sources.map((s, i) => `${i + 1}. ${s.filename}`).join("\n") : `Nenhum PDF cadastrado ainda`,
+        ].join("\n\n");
+
+        await supabase.from('messages').insert({
+          chat_id: chatId,
           content: replyContent,
-        };
-        return [...prev, reply];
-      });
-      // Marcar mensagem do usuário como enviada
-      setMessages(prev => prev.map(m => 
-        m.id === userMessage.id ? { ...m, status: 'sent' } : m
-      ));
+          sender: 'assistant'
+        });
+      }
+
+    } catch (err: any) {
+      console.error('Error sending message:', err);
+      toast({ title: 'Erro ao enviar', description: err?.message || 'Falha ao enviar mensagem', variant: 'destructive' });
+      addSystemMessage('Erro: ' + (err?.message || String(err)));
+    } finally {
       setIsLoading(false);
       isProcessingRef.current = false;
     }

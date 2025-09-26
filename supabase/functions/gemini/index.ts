@@ -64,13 +64,17 @@ serve(async (req) => {
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Fetch recent messages for context (max 8 pairs = 16 messages)
+    // Constants for context management
+    const MAX_MESSAGES = 12;
+    const MAX_CONTEXT_CHARS = 5000;
+
+    // Fetch recent messages for context (max 12 messages = ~6 pairs)
     const { data: recentMessages, error: messagesError } = await supabase
       .from('messages')
       .select('*')
       .eq('chat_id', chatId)
       .order('created_at', { ascending: false })
-      .limit(16);
+      .limit(MAX_MESSAGES);
 
     if (messagesError) {
       console.error('Error fetching messages:', messagesError);
@@ -89,7 +93,7 @@ serve(async (req) => {
         const text = message.content;
         
         // Check if adding this message would exceed character limit
-        if (totalChars + text.length > 4000) break;
+        if (totalChars + text.length > MAX_CONTEXT_CHARS) break;
         
         contents.push({
           role,
@@ -100,12 +104,14 @@ serve(async (req) => {
       }
     }
 
-    // Add current user message
+    // If no context exists, add current user message as fallback
     const truncatedPrompt = prompt.length > 1000 ? prompt.slice(0, 1000) : prompt;
-    contents.push({
-      role: 'user',
-      parts: [{ text: truncatedPrompt }]
-    });
+    if (contents.length === 0) {
+      contents.push({
+        role: 'user',
+        parts: [{ text: truncatedPrompt }]
+      });
+    }
 
     const payload = { contents };
 
@@ -145,16 +151,8 @@ serve(async (req) => {
       // ignore parse errors
     }
 
-    // Save messages to database
+    // Save only assistant response to database (user message already saved by frontend)
     if (text) {
-      // Save user message
-      await supabase.from('messages').insert({
-        chat_id: chatId,
-        content: truncatedPrompt,
-        sender: 'user'
-      });
-
-      // Save assistant response
       await supabase.from('messages').insert({
         chat_id: chatId,
         content: text,
