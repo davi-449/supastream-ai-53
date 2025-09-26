@@ -1,5 +1,6 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.58.0';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -43,7 +44,7 @@ serve(async (req) => {
       });
     }
 
-    const { prompt } = await req.json();
+    const { prompt, chatId } = await req.json();
     if (!prompt || typeof prompt !== 'string') {
       return new Response(JSON.stringify({ error: 'Prompt is required' }), {
         status: 400,
@@ -51,20 +52,62 @@ serve(async (req) => {
       });
     }
 
-    const truncated = prompt.length > 5000 ? prompt.slice(0, 5000) : prompt;
+    if (!chatId || typeof chatId !== 'string') {
+      return new Response(JSON.stringify({ error: 'Chat ID is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
 
-    const payload = {
-      // minimal request shape that matches the generativelanguage examples
-      contents: [
-        {
-          parts: [
-            {
-              text: truncated,
-            },
-          ],
-        },
-      ],
-    };
+    // Initialize Supabase client
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    // Fetch recent messages for context (max 8 pairs = 16 messages)
+    const { data: recentMessages, error: messagesError } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('chat_id', chatId)
+      .order('created_at', { ascending: false })
+      .limit(16);
+
+    if (messagesError) {
+      console.error('Error fetching messages:', messagesError);
+    }
+
+    // Build contents array with context
+    const contents = [];
+    
+    // Add recent messages as context (reverse to get chronological order)
+    if (recentMessages && recentMessages.length > 0) {
+      const contextMessages = recentMessages.reverse();
+      let totalChars = 0;
+      
+      for (const message of contextMessages) {
+        const role = message.sender === 'user' ? 'user' : 'model';
+        const text = message.content;
+        
+        // Check if adding this message would exceed character limit
+        if (totalChars + text.length > 4000) break;
+        
+        contents.push({
+          role,
+          parts: [{ text }]
+        });
+        
+        totalChars += text.length;
+      }
+    }
+
+    // Add current user message
+    const truncatedPrompt = prompt.length > 1000 ? prompt.slice(0, 1000) : prompt;
+    contents.push({
+      role: 'user',
+      parts: [{ text: truncatedPrompt }]
+    });
+
+    const payload = { contents };
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${encodeURIComponent(
       geminiApiKey
@@ -100,6 +143,23 @@ serve(async (req) => {
     } catch (e) {
       console.warn('Error parsing Gemini response:', e);
       // ignore parse errors
+    }
+
+    // Save messages to database
+    if (text) {
+      // Save user message
+      await supabase.from('messages').insert({
+        chat_id: chatId,
+        content: truncatedPrompt,
+        sender: 'user'
+      });
+
+      // Save assistant response
+      await supabase.from('messages').insert({
+        chat_id: chatId,
+        content: text,
+        sender: 'assistant'
+      });
     }
 
     console.log('Gemini API success, text length:', text?.length || 0);

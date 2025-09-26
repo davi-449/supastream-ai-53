@@ -59,6 +59,7 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+  const [chatId, setChatId] = useState<string | null>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -69,19 +70,96 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
   const accessibleFiles = useMemo(() => knowledge.queryAccessible(projectId).files, [projectId, messages.length, hasDocuments]);
 
   useEffect(() => {
-    // Do not read from localStorage. Initialize with a neutral hello message that doesn't include any local mocks.
-    const hello: Message = {
-      id: "hello",
-      content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Conecte o Supabase para carregar dados reais.`,
-      sender: "pilot",
-      timestamp: new Date().toISOString(),
-      status: "sent",
-      sources: accessibleFiles,
-      checklist: buildChecklist(projectId),
+    const initializeChat = async () => {
+      const client = supabaseRef.current;
+      if (!client) {
+        // Initialize with greeting message if no Supabase connection
+        const hello: Message = {
+          id: "hello",
+          content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Conecte o Supabase para carregar dados reais.`,
+          sender: "pilot",
+          timestamp: new Date().toISOString(),
+          status: "sent",
+          sources: accessibleFiles,
+          checklist: buildChecklist(projectId),
+        };
+        setMessages([hello]);
+        return;
+      }
+
+      try {
+        // Create or get existing chat for this project
+        const { data: existingChat } = await client
+          .from('chats')
+          .select('*')
+          .eq('project_id', projectId)
+          .single();
+
+        let currentChatId;
+        if (existingChat) {
+          currentChatId = existingChat.id;
+        } else {
+          // Create new chat
+          const { data: newChat } = await client
+            .from('chats')
+            .insert({ project_id: projectId })
+            .select()
+            .single();
+          currentChatId = newChat?.id;
+        }
+
+        setChatId(currentChatId);
+
+        if (currentChatId) {
+          // Load existing messages
+          const { data: existingMessages } = await client
+            .from('messages')
+            .select('*')
+            .eq('chat_id', currentChatId)
+            .order('created_at', { ascending: true });
+
+          if (existingMessages && existingMessages.length > 0) {
+            const formattedMessages = existingMessages.map(msg => ({
+              id: msg.id,
+              content: msg.content,
+              sender: msg.sender as 'user' | 'pilot',
+              timestamp: msg.created_at || new Date().toISOString(),
+              status: 'sent' as const
+            }));
+            setMessages(formattedMessages);
+          } else {
+            // Add initial greeting message
+            const hello: Message = {
+              id: "hello",
+              content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Como posso ajudá-lo hoje?`,
+              sender: "pilot",
+              timestamp: new Date().toISOString(),
+              status: "sent",
+              sources: accessibleFiles,
+              checklist: buildChecklist(projectId),
+            };
+            setMessages([hello]);
+          }
+        }
+      } catch (error) {
+        console.error('Error initializing chat:', error);
+        // Fallback to initial message
+        const hello: Message = {
+          id: "hello",
+          content: `Olá! Eu sou o Pilot, sua assistente do projeto **${projectName}**. Conecte o Supabase para carregar dados reais.`,
+          sender: "pilot",
+          timestamp: new Date().toISOString(),
+          status: "sent",
+          sources: accessibleFiles,
+          checklist: buildChecklist(projectId),
+        };
+        setMessages([hello]);
+      }
     };
-    setMessages([hello]);
+
+    initializeChat();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+  }, [projectId, supabaseRef.current]);
 
   useEffect(() => {
     // Local persistence disabled. All chat history should be stored in Supabase only.
@@ -235,10 +313,14 @@ const PilotChat = ({ projectId, projectName, hasDocuments }: PilotChatProps) => 
     // If Gemini is enabled (feature flag + backend health), call backend proxy
     if (geminiEnabled) {
       try {
+        if (!chatId) {
+          throw new Error('Chat not initialized');
+        }
+
         const resp = await fetch('https://emfddmyurnlsvpvlplzj.supabase.co/functions/v1/gemini', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt: content })
+          body: JSON.stringify({ prompt: content, chatId })
         });
         const out = await resp.json();
         if (!resp.ok) {
