@@ -1,0 +1,4 @@
+project_id = "emfddmyurnlsvpvlplzj"
+
+[functions.gemini]
+verify_jwt = false
